@@ -17,28 +17,30 @@ import utils.TubaoMelkman
 import scala.collection.mutable.ArrayBuffer
 
 /**
- * sparkSQL, 从hive读取wifi和vehicle数据, 算出落脚点, 存入mongo
- */
+  * sparkSQL, 从hive读取wifi和vehicle数据, 算出落脚点, 存入mongo
+  */
 object ComputeFootHold extends Logging {
 
   def main(args: Array[String]): Unit = {
     val durationTime = if (args.length > 0) args(0).trim.toInt else -1
     val dt = if (args.length > 1) args(1).trim else "20190921"
-    val sc = new SparkConf().setIfMissing("spark.master", "local[*]").setAppName("footHolds_demo")
+    val conf = new SparkConf()
+      .setIfMissing("spark.master", "local[*]")
+      .setAppName("footHoldsCompute")
       .set("spark.mongodb.output.uri", "mongodb://100.67.29.64:27017,100.67.29.65:27017,100.67.29.66:27017/whs.foothold")
-    val spark = SparkSession.builder().config(sc).enableHiveSupport().getOrCreate()
+    val spark = SparkSession.builder().config(conf).enableHiveSupport().getOrCreate()
 
     import spark.implicits._
 
     //1. 从hive中读取数据, 封装成Bean对象 VehicleData 和 WifiData.  格式为RDD
-    val wifiInputRDD: Dataset[caseEntity.WifiData] = spark.sql("select t1.macAddress,t1.brand,t1.captureTime,t1.deviceId,t1.strength ," +
+    val wifiInputRDD: Dataset[WifiDataCase] = spark.sql("select t1.macAddress,t1.brand,t1.captureTime,t1.deviceId,t1.strength ," +
       "t1.identificationType ,t1.certificateCode ,t1.apSsid ,t1.apMac ,t1.apChannel,t1.encryptType ," +
       "t1.xCoordinate ,t1.yCoordinate ,t1.placeCode ,t1.placeName ,t1.devNo ,t1.longitude ,t1.latitude," +
-      s"dt from dwd.dwd_wifi_whs_opt as t1 where dt=$dt").as[caseEntity.WifiData]
+      s"dt from dwd.dwd_wifi_whs_opt as t1 where dt=$dt").as[WifiDataCase]
 
-    val vehicleInputRDD: Dataset[caseEntity.VehicleData] = spark.sql("select t1.plateNumber, t1.passTime,t1.deviceId, t1.deviceName," +
+    val vehicleInputRDD: Dataset[VehicleDataCase] = spark.sql("select t1.plateNumber, t1.passTime,t1.deviceId, t1.deviceName," +
       "t1.placeName, t1.longitude,t1.latitude from dwd.dwd_car_whs_rt as t1 " +
-      s"where dt=$dt").as[caseEntity.VehicleData]
+      s"where dt=$dt").as[VehicleDataCase]
 
     val wifiRDD: RDD[WifiData] = wifiInputRDD.rdd.map { inputWifi =>
       val w = new WifiData
@@ -66,7 +68,7 @@ object ComputeFootHold extends Logging {
     }
 
     //2. 数据转换, 将 mac和 vehicle信息, 聚合成落脚点数据, 存入mongo表 dws_whs_foothold
-    // 2.1 wifi数据转换
+    // 2.1 wifi数据转
     val wifiGroupById = wifiRDD.map(item => (item.getMacAddress, item)).groupByKey() // 按MAC地址聚合
     val wifiFormat: Dataset[WhsFootHold] = wifiGroupById.mapPartitions { part =>
       part.map { wifi =>
@@ -76,7 +78,7 @@ object ComputeFootHold extends Logging {
     }.filter(_.isDefined).map(_.get).toDS()
     MongoSpark.save(wifiFormat)
 
-    // 2.2 vehicle数据转换
+    // 2.2 vehicle数据
     val vehicleGroupById = vehicleRDD.map(item => (item.getPlateNumber, item)).groupByKey() // 按车牌号聚合
     val vehicleFormat: Dataset[WhsFootHold] = vehicleGroupById.mapPartitions { part =>
       // 从连接池中拿到mongo连接
@@ -91,10 +93,18 @@ object ComputeFootHold extends Logging {
   }
 
   /**
-   * @param wifiDataArr 输入多条mac地址相同的wifi记录, 聚合成该mac的一条落脚点相关信息, 写入mongo
-   */
+    * @param wifiDataArr 输入多条mac地址相同的wifi记录, 聚合成该mac的一条落脚点相关信息, 写入mongo
+    */
   def generateDataFromWifi(wifiDataArr: Array[WifiData], durationTime: Int, dt: String): Option[WhsFootHold] = {
-    val wifiSorted: Array[(WifiData, Int)] = wifiDataArr.sortBy(_.getCaptureTime)(Ordering[Date]).zipWithIndex
+    // 将时间粒度设为分钟 : 该MAC地址每分钟只保留一条记录(取设备ID最小的)
+    val minDateFormat = new SimpleDateFormat("yyyyMMddHHmm")
+    val wifiDataArrMinUnique: Array[WifiData] = wifiDataArr.
+      map(item => (minDateFormat.format(item.getCaptureTime), item))
+      .groupBy(_._1)
+      .map(item => item._2.sortBy(_._2.getDeviceId)(Ordering[Int]).head._2).toArray
+
+
+    val wifiSorted: Array[(WifiData, Int)] = wifiDataArrMinUnique.sortBy(_.getCaptureTime)(Ordering[Date]).zipWithIndex
     // 找到连续时间对应的下标  (设备ID, 下标)
     val continuousIndex: ArrayBuffer[(Int, Int)] = findContinuousIndex(wifiSorted.map(item => (item._1.getDeviceId, item._2)))
 
@@ -136,10 +146,17 @@ object ComputeFootHold extends Logging {
   }
 
   /**
-   * @param vehicleDataArr 输入多条车牌号相同的车辆记录, 聚合成该车辆的一条落脚点相关信息, 写入mongo
-   */
+    * @param vehicleDataArr 输入多条车牌号相同的车辆记录, 聚合成该车辆的一条落脚点相关信息, 写入mongo
+    */
   def generateDataFromVehicle(vehicleDataArr: Array[VehicleData], durationTime: Int, dt: String): Option[WhsFootHold] = {
-    val vehicleSorted: Array[(VehicleData, Int)] = vehicleDataArr.sortBy(_.getPassTime)(Ordering[Long]).zipWithIndex
+    // 将时间粒度设为分钟 : 该车牌号每分钟只保留一条记录(取设备ID最小的)
+    val minDateFormat = new SimpleDateFormat("yyyyMMddHHmm")
+    val vehicleDataArrMinUnique: Array[VehicleData] = vehicleDataArr.
+      map(item => (minDateFormat.format(new Date(item.getPassTime)), item))
+      .groupBy(_._1)
+      .map(item => item._2.sortBy(_._2.getDeviceId)(Ordering[Int]).head._2).toArray
+
+    val vehicleSorted: Array[(VehicleData, Int)] = vehicleDataArrMinUnique.sortBy(_.getPassTime)(Ordering[Long]).zipWithIndex
     // 找到连续时间对应的下标  (设备ID, 下标)
     val continuousIndex: ArrayBuffer[(Int, Int)] = findContinuousIndex(vehicleSorted.map(item => (item._1.getDeviceId, item._2)))
 
@@ -178,11 +195,11 @@ object ComputeFootHold extends Logging {
 
 
   /**
-   * 寻找wifi或者车辆信息的连续时间下标
-   *
-   * @param DataSorted : 已经按时间排序好的数据  (设备ID, 下标)
-   * @return
-   */
+    * 寻找wifi或者车辆信息的连续时间下标
+    *
+    * @param DataSorted : 已经按时间排序好的数据  (设备ID, 下标)
+    * @return
+    */
   def findContinuousIndex(DataSorted: Array[(Int, Int)]): ArrayBuffer[(Int, Int)] = {
     val continuousIndex = ArrayBuffer[(Int, Int)]()
     // 遍历数组, 找到id所停留的连续时间段
@@ -208,11 +225,10 @@ object ComputeFootHold extends Logging {
   }
 
   /**
-   * 计算凸包点
-   *
-   * @param points
-   * @return
-   */
+    * 计算凸包点
+    * @param points
+    * @return
+    */
   def getConvexHull(points: Array[Point]): String = {
     // 构造Point
     val pointList = new util.ArrayList[utils.Point]()
@@ -251,11 +267,11 @@ object ComputeFootHold extends Logging {
   }
 
   /**
-   * 将FootHold的样例类数组转为json格式的字符串
-   *
-   * @param footholds
-   * @return
-   */
+    * 将FootHold的样例类数组转为json格式的字符串
+    *
+    * @param footholds
+    * @return
+    */
   def footHoldsToString(footholds: Array[FootHold]): String = {
     val footHoldList = new util.ArrayList[util.HashMap[String, String]]()
     footholds.foreach { ft =>
@@ -273,41 +289,3 @@ object ComputeFootHold extends Logging {
 
   }
 }
-
-/**
- * 下沉到mongo中dws_whs_foothold表的字段
- *
- * @param _id        主键 (update + sourceValue的hash)
- * @param sourceType
- * @param sourceValue
- * @param personName 人员姓名
- * @param personId   身份证号
- * @param picUrl     图片url
- * @param updateDate 更新日期
- * @param foothods   落脚点信息
- * @param range
- */
-case class WhsFootHold(_id: String, sourceType: Int, sourceValue: String, personName: String, personId: String, picUrl: String, updateDate: String, foothods: String, range: String)
-
-/**
- *
- * @param footholdDeviceId  设备ID
- * @param footholdPlaceName
- * @param footholdLongitude 经度
- * @param footholdLatitude  维度
- * @param footholdTimeLong  : 停留时长 : min
- * @param footholdStartTime 落脚点起始时间
- * @param footholdEndTime   落脚点结束时间
- */
-case class FootHold(footholdDeviceId: Int, footholdPlaceName: String, footholdLongitude: Double, footholdLatitude: Double, footholdTimeLong: Double, footholdStartTime: String, footholdEndTime: String)
-
-/**
- * 设备id的经纬度地址
- *
- * @param longitude
- * @param latitude
- */
-case class Point(longitude: Double, latitude: Double, deviceId: Int)
-
-
-

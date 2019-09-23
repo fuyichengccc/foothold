@@ -1,12 +1,17 @@
 package utils;
 
-public class Point{
-    private float x;	    //X 经度
-    private float y;	    //Y 维度
-    private double arCos;	//与P0点的角度
-    private int deviceId;
+public class Point {
+    private float x;        //X 经度
+    private float y;        //Y 维度
+    private double arCos;    //与P0点的角度
+    private int deviceId;  // 设备id
 
     public Point() {
+    }
+
+    public Point(float x, float y) {
+        this.x = x;
+        this.y = y;
     }
 
     public Point(float x, float y, int deviceId) {
@@ -18,18 +23,23 @@ public class Point{
     public float getX() {
         return x;
     }
+
     public void setX(float x) {
         this.x = x;
     }
+
     public float getY() {
         return y;
     }
+
     public void setY(float y) {
         this.y = y;
     }
+
     public double getArCos() {
         return arCos;
     }
+
     public void setArCos(double arCos) {
         this.arCos = arCos;
     }
