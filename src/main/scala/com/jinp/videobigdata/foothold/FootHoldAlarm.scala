@@ -10,6 +10,7 @@ import com.jinp.videobigdata.entity.{VehicleData, WifiData}
 import com.jinp.videobigdata.foothold.javaEntity.FootHoldJava
 import com.mongodb.spark.MongoSpark
 import com.mongodb.spark.config.ReadConfig
+import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.spark.internal.Logging
 import org.apache.spark.{SparkConf, SparkContext}
@@ -49,7 +50,7 @@ object FootHoldAlarm extends Logging {
       "key.deserializer" -> classOf[StringDeserializer],
       "value.deserializer" -> classOf[StringDeserializer],
       "group.id" -> groupId,
-      "auto.offset.reset" -> "latest",
+      "auto.offset.reset" -> "earliest",
       "enable.auto.commit" -> (true: java.lang.Boolean)
     )
     val stream = KafkaUtils.createDirectStream[String, String](
@@ -68,10 +69,11 @@ object FootHoldAlarm extends Logging {
       eachRDD.foreachPartition { part =>
         val footholds = footholdsGroupBroad.value
         part.foreach { value =>
-          if ("消费ifi数据" == true) {
-            log.warn("START to process one wifi message from kafka")
+          log.warn("START to process one message from kafka")
+          try{
             // 匹配MAC地址对应的所有落脚点数据
             val wifi = JSON.parseObject(value, classOf[WifiData])
+            log.warn("start to process one wifi message from kafka")
             footholds.get(wifi.getMacAddress) match {
               case Some(arr) => {
                 // 判断该条wifi信息和所有落脚点信息的报警结果, 必须所有落脚点达到报警条件才报警
@@ -88,28 +90,34 @@ object FootHoldAlarm extends Logging {
               }
               case None => // 该mac地址的落脚点数据未计算
             }
-          }
-          else if ("消费到车辆数据" == true) {
-            log.warn("START to process one vehicle message from kafka")
-            // 匹配车牌号对应的所有落脚点数据
-            val vehicle = JSON.parseObject(value, classOf[VehicleData])
-            footholds.get(vehicle.getPlateNumber.toString) match {
-              case Some(arr) =>
-                // 判断该条车牌号和所有落脚点信息的报警结果, 必须所有落脚点达到报警条件才报警
-                val hmFormat = new SimpleDateFormat("HHmm")
-                val oDate = new Date(vehicle.getPassTime)
-                val callFlag: Array[Boolean] = arr.map { ft =>
-                  val trigger1 = ft.footholdDeviceId == vehicle.getDeviceId && !(ft.footholdStartTime.trim.toInt < hmFormat.format(oDate).toInt && hmFormat.format(oDate).toInt < ft.footholdEndTime.trim.toInt)
-                  val trigger2 = ft.footholdDeviceId != vehicle.getDeviceId && ft.footholdStartTime.trim.toInt < hmFormat.format(oDate).toInt && hmFormat.format(oDate).toInt < ft.footholdEndTime.trim.toInt
-                  if (trigger1 || trigger2) true else false
+          }catch {
+            case e :Exception =>
+              try{
+                // 匹配车牌号对应的所有落脚点数据
+                val vehicle = JSON.parseObject(value, classOf[VehicleData])
+                log.warn("start to process one vehicle message from kafka")
+                footholds.get(vehicle.getPlateNumber.toString) match {
+                  case Some(arr) =>
+                    // 判断该条车牌号和所有落脚点信息的报警结果, 必须所有落脚点达到报警条件才报警
+                    val hmFormat = new SimpleDateFormat("HHmm")
+                    val oDate = new Date(vehicle.getPassTime)
+                    val callFlag: Array[Boolean] = arr.map { ft =>
+                      val trigger1 = ft.footholdDeviceId == vehicle.getDeviceId && !(ft.footholdStartTime.trim.toInt < hmFormat.format(oDate).toInt && hmFormat.format(oDate).toInt < ft.footholdEndTime.trim.toInt)
+                      val trigger2 = ft.footholdDeviceId != vehicle.getDeviceId && ft.footholdStartTime.trim.toInt < hmFormat.format(oDate).toInt && hmFormat.format(oDate).toInt < ft.footholdEndTime.trim.toInt
+                      if (trigger1 || trigger2) true else false
+                    }
+                    if (!callFlag.contains(false)) {
+                      // TODO 每个落脚点都达到报警条件, 选择报警
+                    }
+                  case None => // 该车牌号的落脚点数据未计算
                 }
-                if (!callFlag.contains(false)) {
-                  // TODO 每个落脚点都达到报警条件, 选择报警
-                }
-              case None => // 该车牌号的落脚点数据未计算
-            }
+              } catch{
+                case e : Exception => log.warn("json parse exception \t" + rec.value())
+              }
+
           }
-          log.warn("finished to process one message from kafka")
+
+          log.warn("FINISHED to process one message from kafka")
         }
       }
 
