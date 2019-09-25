@@ -70,7 +70,7 @@ object FootHoldAlarm extends Logging {
         val footholds = footholdsGroupBroad.value
         part.foreach { value =>
           log.warn("START to process one message from kafka")
-          try{
+          try {
             // 匹配MAC地址对应的所有落脚点数据
             val wifi = JSON.parseObject(value, classOf[WifiData])
             log.warn("start to process one wifi message from kafka")
@@ -86,13 +86,16 @@ object FootHoldAlarm extends Logging {
                 }
                 if (!callFlag.contains(false)) {
                   // TODO 每个落脚点都达到报警条件, 选择报警
+                  log.warn("达到报警条件, 发送kafak")
+                } else {
+                  log.warn("未达到报警条件")
                 }
               }
               case None => // 该mac地址的落脚点数据未计算
             }
-          }catch {
-            case e :Exception =>
-              try{
+          } catch {
+            case e: Exception =>
+              try {
                 // 匹配车牌号对应的所有落脚点数据
                 val vehicle = JSON.parseObject(value, classOf[VehicleData])
                 log.warn("start to process one vehicle message from kafka")
@@ -108,11 +111,14 @@ object FootHoldAlarm extends Logging {
                     }
                     if (!callFlag.contains(false)) {
                       // TODO 每个落脚点都达到报警条件, 选择报警
+                      log.warn("达到报警条件, 发送kafka")
+                    } else {
+                      log.warn("未达到报警条件")
                     }
                   case None => // 该车牌号的落脚点数据未计算
                 }
-              } catch{
-                case e : Exception => log.warn("json parse exception \t" + rec.value())
+              } catch {
+                case e: Exception => log.warn("json parse exception \t" + rec.value())
               }
 
           }
