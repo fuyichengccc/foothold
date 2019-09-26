@@ -1,38 +1,28 @@
 package com.jinp.videobigdata.foothold
 
 import java.text.SimpleDateFormat
-import java.util
 import java.util.Date
 
 import com.alibaba.fastjson.JSON
-import com.alibaba.fastjson.serializer.{SerializeConfig, SerializerFeature}
 import com.jinp.videobigdata.entity.{VehicleData, WifiData}
 import com.jinp.videobigdata.foothold.javaEntity.FootHoldJava
 import com.mongodb.spark.MongoSpark
-import com.mongodb.spark.config.ReadConfig
-import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.serialization.StringDeserializer
+import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
-import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.sql.{Dataset, SparkSession}
-import org.apache.spark.streaming.StreamingContext
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.streaming.kafka010.ConsumerStrategies.Subscribe
 import org.apache.spark.streaming.kafka010.KafkaUtils
 import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
+import org.apache.spark.streaming.{Seconds, StreamingContext}
 
 object FootHoldAlarm extends Logging {
 
   def main(args: Array[String]): Unit = {
-    val wifi = JSON.parseObject(
-      """
-        |{"macAddress":"A","captureTime":"2019-01-01 12:00:00"}
-      """.stripMargin, classOf[WifiData])
-
-
     val conf = new SparkConf()
       .setIfMissing("spark.master", "local[*]")
       .setAppName("footHoldsAlarm")
-      .set("spark.mongodb.output.uri", "mongodb://100.67.29.64:27017,100.67.29.65:27017,100.67.29.66:27017/whs.foothold")
+      .set("spark.mongodb.input.uri", "mongodb://100.67.29.64:27017,100.67.29.65:27017,100.67.29.66:27017/whs.foothold")
     implicit val spark = SparkSession.builder().config(conf).getOrCreate()
 
     // 第一部分 : 聚合相关sourceValue的所有落脚点信息 : (sourceValue, 落脚点集合)
@@ -41,17 +31,17 @@ object FootHoldAlarm extends Logging {
 
 
     // 第二部分, 启动sparkStreaming, 消费kafka数据, 和当前mac地址(车牌号)的落脚点集合进行比较,
-    val ssc: StreamingContext = ???
-    val brokers: String = ???
-    val groupId: String = ???
-    val topics: Array[String] = ???
+    val ssc: StreamingContext = new StreamingContext(spark.sparkContext, Seconds(5))
+    val brokers: String = "100.67.29.64:9092,100.67.29.65:9092,100.67.29.66:9092"
+    val groupId: String = "footholds_alarm_test_01"
+    val topics: Array[String] = Array[String]("dwd_wifi_whs_rinse_rt", "dwd_car_whs_rinse_rt")
     val kafkaParams = Map[String, Object](
       "bootstrap.servers" -> brokers,
       "key.deserializer" -> classOf[StringDeserializer],
       "value.deserializer" -> classOf[StringDeserializer],
       "group.id" -> groupId,
-      "auto.offset.reset" -> "earliest",
-      "enable.auto.commit" -> (true: java.lang.Boolean)
+      "auto.offset.reset" -> "latest",
+      "enable.auto.commit" -> (false: java.lang.Boolean)
     )
     val stream = KafkaUtils.createDirectStream[String, String](
       ssc,
@@ -69,6 +59,7 @@ object FootHoldAlarm extends Logging {
       eachRDD.foreachPartition { part =>
         val footholds = footholdsGroupBroad.value
         part.foreach { value =>
+          val mStart = new Date().getTime
           log.warn("START to process one message from kafka")
           try {
             // 匹配MAC地址对应的所有落脚点数据
@@ -86,12 +77,14 @@ object FootHoldAlarm extends Logging {
                 }
                 if (!callFlag.contains(false)) {
                   // TODO 每个落脚点都达到报警条件, 选择报警
-                  log.warn("达到报警条件, 发送kafak")
+                  val dateFormat = new SimpleDateFormat("yyyyMMdd-HH:mm:SS")
+                  log.warn(s"达到报警条件, 发送kafak => MAC地址 : ${wifi.getMacAddress}, 时间 : ${dateFormat.format(wifi.getCaptureTime)}, 设备id : ${wifi.getDeviceId}")
                 } else {
                   log.warn("未达到报警条件")
                 }
               }
               case None => // 该mac地址的落脚点数据未计算
+                println("can't find footholds data about this mac")
             }
           } catch {
             case e: Exception =>
@@ -111,36 +104,38 @@ object FootHoldAlarm extends Logging {
                     }
                     if (!callFlag.contains(false)) {
                       // TODO 每个落脚点都达到报警条件, 选择报警
-                      log.warn("达到报警条件, 发送kafka")
+                      val dateFormat = new SimpleDateFormat("yyyyMMdd-HH:mm:SS")
+                      log.warn(s"达到报警条件, 发送kafka => 车牌号 : ${vehicle.getPlateNumber}, 时间 : ${dateFormat.format(new Date(vehicle.getPassTime))}, 设备id : ${vehicle.getDeviceId}, 设备名称:${vehicle.getDeviceName}")
                     } else {
                       log.warn("未达到报警条件")
                     }
                   case None => // 该车牌号的落脚点数据未计算
+                    log.warn("can't find footholds data about this vehicle")
                 }
               } catch {
-                case e: Exception => log.warn("json parse exception \t" + rec.value())
+                case e: Exception => log.warn("json parse exception \t" + value)
               }
-
           }
-
-          log.warn("FINISHED to process one message from kafka")
+          val mEnd = new Date().getTime
+          log.warn(s"FINISHED to process one message from kafka with ${mEnd - mStart} ms")
         }
       }
-
     }
 
+    ssc.start()
+    ssc.awaitTermination()
   }
 
   /**
-    * 返回落脚点集合 :  (sourceValue, 落脚点集合)
-    *
-    * @return
-    */
+   * 返回落脚点集合 :  (sourceValue, 落脚点集合)
+   *
+   * @return
+   */
   def getAllFootholds()(implicit spark: SparkSession): Map[String, Array[FootHold]] = {
     log.warn("START to load and compute footholds forom mongodb")
     import spark.implicits._
     // 1. 要布控的所有落脚点信息 [定时更新][根据此信息条件查找所有相关的落脚点]
-    val monitoredFt: Array[MonitoredFootHolds] = ??? // TODO
+    val monitoredFt: Array[MonitoredFootHolds] = Array[MonitoredFootHolds]()
     val monitoredSourceValue = monitoredFt.map { item =>
       item.MonitorObject.toLowerCase match {
         case "车辆" => Some(item.plateNumber)
@@ -149,16 +144,17 @@ object FootHoldAlarm extends Logging {
       }
     }.filter(_.isDefined).map(_.get)
     // 2. 从mongo中查找所有的相关落脚点, 并汇总每个mac地址或车牌号的所有落脚点信息  [WhsFootHold样例类和Mongo中字段一一对应]
-    log.warn("start to load data from mongo")
+    log.warn("START to load and compute data from mongo")
     val allFootHolds: Array[WhsFootHold] = MongoSpark.load(spark).as[WhsFootHold]
-      .filter(item => monitoredSourceValue.contains(item.sourceValue)).collect()
+      //      .filter(item => monitoredSourceValue.contains(item.sourceValue))
+      .collect()
     log.warn("start to aggregate data")
     // 3. 得到某个mac或车牌的所有落脚点 : (sourceValue, 落脚点集合])
     val allFootHoldsGroup = allFootHolds
       .groupBy(_.sourceValue)
       .map { item =>
         val sourceValue = item._1
-        val fts = item._2.flatMap { whsFt => JSON.parseArray[FootHoldJava](whsFt.footholds, classOf[FootHoldJava]).toArray(Array[FootHoldJava]()) }
+        val fts = item._2.flatMap { whsFt => JSON.parseArray[FootHoldJava](whsFt.foothods, classOf[FootHoldJava]).toArray(Array[FootHoldJava]()) }
         // java转scala样例类
         val ftsCase = fts.map(ft => FootHold(ft.getFootholdDeviceId, ft.getFootholdPlaceName, ft.getFootholdLongitude, ft.getFootholdLatitude, ft.getFootholdTimeLong, ft.getFootholdStartTime, ft.getFootholdEndTime))
         (sourceValue, ftsCase)
@@ -192,17 +188,17 @@ object FootHoldAlarm extends Logging {
 }
 
 /**
-  * 布控的落脚点信息, 需要从mongo中查询并计算
-  *
-  * @param MonitorName
-  * @param MonitorObject
-  * @param plateNumber
-  * @param macAddress
-  * @param compareDate
-  * @param monitorScope
-  * @param startTime
-  * @param endTime
-  */
+ * 布控的落脚点信息, 需要从mongo中查询并计算
+ *
+ * @param MonitorName
+ * @param MonitorObject
+ * @param plateNumber
+ * @param macAddress
+ * @param compareDate
+ * @param monitorScope
+ * @param startTime
+ * @param endTime
+ */
 case class MonitoredFootHolds(
                                MonitorName: String,
                                MonitorObject: String,

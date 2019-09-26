@@ -18,11 +18,11 @@ case class VehicleDataCase(plateNumber: Int, passTime: Long, deviceId: Int, devi
   * @param personName 人员姓名
   * @param personId   身份证号
   * @param picUrl     图片url
-  * @param updateDate 更新日期
-  * @param footholds   落脚点信息
+  * @param dt 更新日期
+  * @param foothods   落脚点信息
   * @param range
   */
-case class WhsFootHold(_id: String, sourceType: Int, sourceValue: String, personName: String, personId: String, picUrl: String, updateDate: String, footholds: String, range: String)
+case class WhsFootHold(_id: String, sourceType: Int, sourceValue: String, personName: String, personId: String, picUrl: String, dt: String, foothods: String, range: String)
 
 /**
   *
