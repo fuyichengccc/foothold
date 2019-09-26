@@ -18,7 +18,7 @@ case class VehicleDataCase(plateNumber: Int, passTime: Long, deviceId: Int, devi
   * @param personName 人员姓名
   * @param personId   身份证号
   * @param picUrl     图片url
-  * @param dt 更新日期
+  * @param dt 更新日期  yyyyMMdd
   * @param foothods   落脚点信息
   * @param range
   */

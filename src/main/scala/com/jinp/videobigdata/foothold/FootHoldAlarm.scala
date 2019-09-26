@@ -10,11 +10,13 @@ import com.mongodb.spark.MongoSpark
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{Dataset, SparkSession}
 import org.apache.spark.streaming.kafka010.ConsumerStrategies.Subscribe
 import org.apache.spark.streaming.kafka010.KafkaUtils
 import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
 import org.apache.spark.streaming.{Seconds, StreamingContext}
+import org.apache.spark.util.LongAccumulator
+import org.joda.time.DateTime
 
 object FootHoldAlarm extends Logging {
 
@@ -22,15 +24,18 @@ object FootHoldAlarm extends Logging {
     val conf = new SparkConf()
       .setIfMissing("spark.master", "local[*]")
       .setAppName("footHoldsAlarm")
-      .set("spark.mongodb.input.uri", "mongodb://100.67.29.64:27017,100.67.29.65:27017,100.67.29.66:27017/whs.foothold")
+      .set("spark.mongodb.input.uri", "mongodb://100.67.29.64:27017,100.67.29.65:27017,100.67.29.66:27017/whs.foothold") // TODO  可以修改ssc的参数
     implicit val spark = SparkSession.builder().config(conf).getOrCreate()
 
+    import spark.implicits._
     // 第一部分 : 聚合相关sourceValue的所有落脚点信息 : (sourceValue, 落脚点集合)
     val footholdsGroup: Map[String, Array[FootHold]] = getAllFootholds()
-    var footholdsGroupBroad = spark.sparkContext.broadcast(footholdsGroup) // TODO 需要定时更新广播变量
+    var footholdsGroupBroad = spark.sparkContext.broadcast(footholdsGroup)
+    // 广播变量 :  用来更新布控点
+    var updateBroadValue = spark.sparkContext.broadcast(new Date().getTime / 1000 / 60 / 60)
 
 
-    // 第二部分, 启动sparkStreaming, 消费kafka数据, 和当前mac地址(车牌号)的落脚点集合进行比较,
+    // 第二部分, 启动sparkStreaming, 消费kafka数据, 和当前mac地址(车牌号)的落脚点集合进行比较, //TODO 修改kafka参数
     val ssc: StreamingContext = new StreamingContext(spark.sparkContext, Seconds(5))
     val brokers: String = "100.67.29.64:9092,100.67.29.65:9092,100.67.29.66:9092"
     val groupId: String = "footholds_alarm_test_01"
@@ -49,12 +54,17 @@ object FootHoldAlarm extends Logging {
       Subscribe[String, String](topics, kafkaParams)
     )
     stream.map(_.value()).foreachRDD { eachRDD =>
-      // 定期更新广播变量
-      if ("当前时间满足更新条件" == true) {
+      // 1小时更新一次广播变量
+      val currentHour = new Date().getTime / 1000 / 60 / 60
+      if (currentHour - updateBroadValue.value > 0) {
+        log.warn("start to update footholds BroadValue")
         if (footholdsGroupBroad != null) {
           footholdsGroupBroad.unpersist(true)
-          footholdsGroupBroad = spark.sparkContext.broadcast(getAllFootholds())
         }
+        footholdsGroupBroad = spark.sparkContext.broadcast(getAllFootholds())
+        // 初始化updateValuebroad
+        updateBroadValue.unpersist()
+        updateBroadValue =spark.sparkContext.broadcast(currentHour)
       }
       eachRDD.foreachPartition { part =>
         val footholds = footholdsGroupBroad.value
@@ -76,7 +86,7 @@ object FootHoldAlarm extends Logging {
                   if (trigger1 || trigger2) true else false
                 }
                 if (!callFlag.contains(false)) {
-                  // TODO 每个落脚点都达到报警条件, 选择报警
+                  // TODO 每个落脚点都达到报警条件, 选择报警, 发送kafka
                   val dateFormat = new SimpleDateFormat("yyyyMMdd-HH:mm:SS")
                   log.warn(s"达到报警条件, 发送kafak => MAC地址 : ${wifi.getMacAddress}, 时间 : ${dateFormat.format(wifi.getCaptureTime)}, 设备id : ${wifi.getDeviceId}")
                 } else {
@@ -103,7 +113,7 @@ object FootHoldAlarm extends Logging {
                       if (trigger1 || trigger2) true else false
                     }
                     if (!callFlag.contains(false)) {
-                      // TODO 每个落脚点都达到报警条件, 选择报警
+                      // TODO 每个落脚点都达到报警条件, 选择报警, 发送kafka
                       val dateFormat = new SimpleDateFormat("yyyyMMdd-HH:mm:SS")
                       log.warn(s"达到报警条件, 发送kafka => 车牌号 : ${vehicle.getPlateNumber}, 时间 : ${dateFormat.format(new Date(vehicle.getPassTime))}, 设备id : ${vehicle.getDeviceId}, 设备名称:${vehicle.getDeviceName}")
                     } else {
@@ -127,28 +137,48 @@ object FootHoldAlarm extends Logging {
   }
 
   /**
-   * 返回落脚点集合 :  (sourceValue, 落脚点集合)
-   *
-   * @return
-   */
+    * 返回落脚点集合 :  (sourceValue, 落脚点集合)
+    *
+    * @return
+    */
   def getAllFootholds()(implicit spark: SparkSession): Map[String, Array[FootHold]] = {
     log.warn("START to load and compute footholds forom mongodb")
     import spark.implicits._
     // 1. 要布控的所有落脚点信息 [定时更新][根据此信息条件查找所有相关的落脚点]
-    val monitoredFt: Array[MonitoredFootHolds] = Array[MonitoredFootHolds]()
-    val monitoredSourceValue = monitoredFt.map { item =>
-      item.MonitorObject.toLowerCase match {
-        case "车辆" => Some(item.plateNumber)
-        case "mac" => Some(item.macAddress)
+    val monitoredFt: Array[MonitoredFootHolds] = spark.read // TODO 修改mysql参数
+      .format("jdbc")
+      .option("url", "jdbc:mysql://192.168.15.171:3307")
+      .option("query", "select * from footholdsAlarm.t_surveillance_more_foothold where current_time between start_time and end_time")
+      .option("user", "root")
+      .option("password", "1234")
+      .load.as[MonitoredFootHolds]
+      .collect()
+    // 提取sourceValue为key, 构造Map对象 :  (sourceValue, 布控点)
+    val monitoredSourceValue: Map[String, MonitoredFootHolds] = monitoredFt.map { item =>
+      val sourceValue = item.sur_types.toLowerCase match {
+        case "wifi" => Some(item.car_no)
+        case "car" => Some(item.mac_address)
         case _ => None
       }
-    }.filter(_.isDefined).map(_.get)
+      (sourceValue, item)
+    }.filter(_._1.isDefined).map(ft => (ft._1.get, ft._2)).toMap
+
     // 2. 从mongo中查找所有的相关落脚点, 并汇总每个mac地址或车牌号的所有落脚点信息  [WhsFootHold样例类和Mongo中字段一一对应]
     log.warn("START to load and compute data from mongo")
+    val ymdFormat = new SimpleDateFormat("yyyyMMdd")
     val allFootHolds: Array[WhsFootHold] = MongoSpark.load(spark).as[WhsFootHold]
-      //      .filter(item => monitoredSourceValue.contains(item.sourceValue))
+      .filter { ft =>
+        // 过滤条件 :  已经布控, 并且dt在比较时段内
+        monitoredSourceValue.get(ft.sourceValue) match {
+          case Some(mFt) =>
+            ymdFormat.format(new Date(mFt.compare_start_time.getTime)).toInt <= ft.sourceValue.trim.toInt &&
+              ymdFormat.format(new Date(mFt.compare_end_time.getTime)).toInt <= ft.sourceValue.trim.toInt
+          case None => false
+        }
+      }
       .collect()
     log.warn("start to aggregate data")
+
     // 3. 得到某个mac或车牌的所有落脚点 : (sourceValue, 落脚点集合])
     val allFootHoldsGroup = allFootHolds
       .groupBy(_.sourceValue)
@@ -159,6 +189,7 @@ object FootHoldAlarm extends Logging {
         val ftsCase = fts.map(ft => FootHold(ft.getFootholdDeviceId, ft.getFootholdPlaceName, ft.getFootholdLongitude, ft.getFootholdLatitude, ft.getFootholdTimeLong, ft.getFootholdStartTime, ft.getFootholdEndTime))
         (sourceValue, ftsCase)
       }
+
     //4. 执行合并逻辑 : 对于同一个人的多个落脚点信息, 合并成一条
     log.warn("start to merge data")
     val hmFormat = new SimpleDateFormat("HHmm")
@@ -183,29 +214,27 @@ object FootHoldAlarm extends Logging {
     log.warn("FINISHED to load and compute footholds from mongodb")
     allFootholdsFiexd
   }
-
-
 }
 
 /**
- * 布控的落脚点信息, 需要从mongo中查询并计算
- *
- * @param MonitorName
- * @param MonitorObject
- * @param plateNumber
- * @param macAddress
- * @param compareDate
- * @param monitorScope
- * @param startTime
- * @param endTime
- */
+  * 布控对象, 和mysql中表t_surveillance_more_foothold对应
+  *
+  * @param name
+  * @param sur_types   布控对象,wifi 或者 car
+  * @param car_no      车牌号
+  * @param mac_address mac地址
+  * @param compare_start_time
+  * @param compare_end_time
+  * @param start_time
+  * @param end_time
+  */
 case class MonitoredFootHolds(
-                               MonitorName: String,
-                               MonitorObject: String,
-                               plateNumber: String = "",
-                               macAddress: String = "",
-                               compareDate: String,
-                               monitorScope: String = "",
-                               startTime: String,
-                               endTime: String
+                               name: String,
+                               sur_types: String,
+                               car_no: String = "",
+                               mac_address: String = "",
+                               compare_start_time: java.sql.Timestamp,
+                               compare_end_time: java.sql.Timestamp,
+                               start_time: java.sql.Timestamp,
+                               end_time: java.sql.Timestamp
                              )
